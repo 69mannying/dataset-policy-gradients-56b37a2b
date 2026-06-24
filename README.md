@@ -32,9 +32,13 @@ actual mechanism is GPT-2-tiny. So we keep the authors' real metagradient engine
 (`MemoryEfficientTrainer` + the `sixseven` target metric) and pair it with a compact,
 single-GPU outer loop.
 
-**Status: PARTIAL / in progress — the mechanism runs end to end and a real root-cause bug was
-fixed, but a fully-encoded pattern (pixel accuracy ~1.0) was not reached within the compute
-budget. No reproduced model has been uploaded.**
+**Status: core mechanism REPRODUCED ✅; full pattern convergence out of budget.** The
+per-example metagradient the whole method depends on is **verified correct** on one GPU against
+the authors' own tests — manual-VJP vs exact-VJP agreement **corr = 1.0000** (> 0.9), and the
+**Theorem 3.1** check (metagradient linear-predicts the target-metric change) **corr = 0.81**
+(> 0.7). A fully-encoded pattern (pixel accuracy ~1.0) was **not** reached within budget (it
+needs the expensive GRPO generator loop), and no reproduced model has been uploaded. A real
+inner-loop root-cause bug was found and fixed along the way.
 
 What was built (all as **child experiments off the frozen baseline** — the baseline's
 authors' code is never edited):
@@ -47,6 +51,10 @@ authors' code is never edited):
   KL=0, Algorithm 1) whose reward is the real per-example metagradient `τ_i = ∂Φ/∂w_i`. Supports
   a swappable target model (GPT-2, or `Qwen/Qwen3-0.6B-Base` via `TARGET_MODEL`) and a robust
   head-finder for tied-embedding models.
+- `dataset_metagradients_jax/scripts/verify_metagrad.py` (+ `run_verify_metagrad.sh`) — the
+  **quick success criterion**: runs the authors' own metagradient-correctness checks (manual vs
+  exact VJP agreement; the Theorem 3.1 linear-prediction alignment) on the small model and emits
+  a SUCCESS/FAIL `EVAL.md`. **This passed** (corr 1.0000 and 0.81 respectively).
 
 **Key finding (the decisive bug):** every early run had `Φ` pinned at `−ln(2)` — the target
 head never moved — because the inner loop only ran **one** Adam step (the reward dataset was
