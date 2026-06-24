@@ -21,10 +21,11 @@ cd "$REPO_DIR/dataset_metagradients_jax"
 # Run from repo root so EVAL.md + .openresearch/artifacts/ land at the root (synced by orx).
 ARTIFACTS_DIR="$REPO_DIR/.openresearch/artifacts"
 uv run python -u scripts/run_minimal_qr.py \
-    --outer-steps "${OUTER_STEPS:-60}" \
-    --inner-steps "${INNER_STEPS:-8}" \
+    --outer-steps "${OUTER_STEPS:-50}" \
+    --inner-steps "${INNER_STEPS:-24}" \
     --pool-size "${POOL_SIZE:-256}" \
     --microbatch-size "${MICROBATCH_SIZE:-32}" \
+    --lr-inner "${LR_INNER:-1.0e-4}" \
     --artifacts "$ARTIFACTS_DIR"
 
 # The driver writes EVAL.md into its CWD (dataset_metagradients_jax/); move it to repo root.
