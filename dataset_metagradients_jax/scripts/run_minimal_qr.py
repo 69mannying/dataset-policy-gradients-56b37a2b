@@ -81,8 +81,10 @@ def main():
     ap.add_argument("--seq-len", type=int, default=128)
     ap.add_argument("--lr-inner", type=float, default=5.0e-6,
                     help="A's Adam LR (paper: 5e-6)")
-    ap.add_argument("--alpha", type=float, default=2.0e5,
-                    help="outer step size on data weights (tau magnitudes are tiny)")
+    ap.add_argument("--alpha-w", type=float, default=1.0,
+                    help="outer step size on normalized data-weight metagradient")
+    ap.add_argument("--max-w", type=float, default=8.0,
+                    help="clip range for data weights (larger => more head movement)")
     ap.add_argument("--strength", type=float, default=20.0, help="s in the pattern loss (paper: 20)")
     ap.add_argument("--artifacts", default=".openresearch/artifacts")
     args = ap.parse_args()
@@ -211,9 +213,10 @@ def main():
         decoded, acc = decode_and_acc(trainer.model)
 
         # Outer "policy" update: ascend Phi on the data weights via the metagradient reward.
-        # tau magnitudes are tiny; normalize then take a fixed step, clipped to a sane range.
+        # tau magnitudes are tiny; normalize, take an alpha-scaled step, allow large positive
+        # weights so the aligned component of the pool's gradients can actually move the head.
         tau_n = tau / (jnp.std(tau) + 1e-12)
-        data_weights = jnp.clip(data_weights + tau_n, 0.0, 8.0)
+        data_weights = jnp.clip(data_weights + args.alpha_w * tau_n, 0.0, args.max_w)
 
         elapsed = time.time() - t_start
         print(f"[minimal-qr] outer {step:03d}  Phi={phi:+.4f}  pixel_acc={acc:.3f}  "

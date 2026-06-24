@@ -25,7 +25,9 @@ uv run python -u scripts/run_minimal_qr.py \
     --inner-steps "${INNER_STEPS:-96}" \
     --pool-size "${POOL_SIZE:-256}" \
     --microbatch-size "${MICROBATCH_SIZE:-32}" \
-    --lr-inner "${LR_INNER:-5.0e-6}" \
+    --lr-inner "${LR_INNER:-1.0e-3}" \
+    --alpha-w "${ALPHA_W:-4.0}" \
+    --max-w "${MAX_W:-64.0}" \
     --artifacts "$ARTIFACTS_DIR"
 
 # The driver writes EVAL.md into its CWD (dataset_metagradients_jax/); move it to repo root.
