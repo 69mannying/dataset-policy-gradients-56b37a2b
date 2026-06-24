@@ -21,6 +21,52 @@ computes dataset weight metagradients through an LLM training + evaluation run. 
 rewards in our project, the code can also be used to compute data weights for other tasks, such as pretraining data
 filtering or mixture weighting.
 
+---
+
+## Single-GPU reproduction effort (this fork)
+
+This fork contains an in-progress effort to reproduce the paper's **QR / "67" weight-encoding
+result on a single GPU**, without the full 8-GPU verl + Llama stack. The intuition: the 8-GPU
+requirement is mostly Llama rollout parallelism + a huge `train_batch_size=24576`, while the
+actual mechanism is GPT-2-tiny. So we keep the authors' real metagradient engine
+(`MemoryEfficientTrainer` + the `sixseven` target metric) and pair it with a compact,
+single-GPU outer loop.
+
+**Status: PARTIAL / in progress — the mechanism runs end to end and a real root-cause bug was
+fixed, but a fully-encoded pattern (pixel accuracy ~1.0) was not reached within the compute
+budget. No reproduced model has been uploaded.**
+
+What was built (all as **child experiments off the frozen baseline** — the baseline's
+authors' code is never edited):
+
+- `dataset_metagradients_jax/scripts/run_minimal_qr.py` (+ `run_minimal_qr.sh`) — runs the real
+  metagradient engine on GPT-2 with the `sixseven` target; outer loop = metagradient ascent on
+  per-example **data weights**. Proves the engine runs end to end on one GPU.
+- `dataset_metagradients_jax/scripts/run_dpg_grpo_min.py` (+ `run_dpg_grpo_min.sh`) — the **real
+  DPG loop**: a small JAX nanoGPT **generator** trained by **GRPO** (group-relative advantages,
+  KL=0, Algorithm 1) whose reward is the real per-example metagradient `τ_i = ∂Φ/∂w_i`. Supports
+  a swappable target model (GPT-2, or `Qwen/Qwen3-0.6B-Base` via `TARGET_MODEL`) and a robust
+  head-finder for tied-embedding models.
+
+**Key finding (the decisive bug):** every early run had `Φ` pinned at `−ln(2)` — the target
+head never moved — because the inner loop only ran **one** Adam step (the reward dataset was
+exactly one batch). Fixed by feeding the generated batch as **T separate global batches with
+stable per-example indices**, so the target trains for **T real Adam steps** and the
+metagradient accumulates each example's influence across all T. After the fix the inner
+training loss drops cleanly (≈20 → ≈10), i.e. the target genuinely trains.
+
+**Remaining blockers** (documented fully in `REPRODUCTION_REPORT.md`): on `Qwen3-0.6B-Base`,
+the huge vocab (151,936) forced microbatching to avoid OOM, the disk-checkpointed VJP on a 0.6B
+model is slow enough to exceed the budget before convergence, and **tied embeddings** make the
+6×7 corner patch a possible zero-gradient dead-zone. **Recommended next step: reproduce cleanly
+on GPT-2 first (the paper's actual target — small, untied head, fast), now that the inner-loop
+bug is fixed, then transfer to Qwen.**
+
+See **`REPRODUCTION_REPORT.md`** (full write-up: tree, results table, root-cause fix, blockers,
+caveats) and **`REPRODUCTION_QA.md`** (the working discussion log) for details.
+
+---
+
 ## Layout
 
 ```
