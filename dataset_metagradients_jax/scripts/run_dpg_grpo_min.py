@@ -70,9 +70,9 @@ def main():
     ap.add_argument("--n-prompts", type=int, default=16, help="prompts per GRPO step")
     ap.add_argument("--group-size", type=int, default=8, help="G: rollouts per prompt (GRPO group)")
     ap.add_argument("--resp-len", type=int, default=32, help="generated tokens per rollout")
-    ap.add_argument("--prompt-len", type=int, default=16)
-    ap.add_argument("--seq-len", type=int, default=64)
-    ap.add_argument("--microbatch-size", type=int, default=32)
+    ap.add_argument("--prompt-len", type=int, default=12)
+    ap.add_argument("--seq-len", type=int, default=48)
+    ap.add_argument("--microbatch-size", type=int, default=4)
     ap.add_argument("--lr-inner", type=float, default=1.0e-3, help="A's Adam LR")
     ap.add_argument("--lr-gen", type=float, default=1.0e-4, help="generator (policy) LR")
     ap.add_argument("--gen-layers", type=int, default=4)
@@ -91,18 +91,20 @@ def main():
                    config=vars(args), mode="online")
 
     n_per_step = args.n_prompts * args.group_size           # generated examples per GRPO step
-    # The inner loop does ONE Adam step per BATCH in the loader. To get T real inner steps we
-    # repeat the generated batch T times (paper trains the synthetic batch for T steps). So:
-    # grad_accum=1, microbatch = n_per_step (one full batch), and the dataset holds T copies.
-    grad_accum = 1
+    # The inner loop does ONE Adam step per global BATCH in the loader; we feed T such batches
+    # so the target trains the synthetic data for T real Adam steps (paper trains the batch for
+    # T steps). Each global batch = grad_accum microbatches of size `microbatch` (= n_per_step).
+    # Microbatching keeps the per-forward logits tensor small -- critical for Qwen's 151936 vocab
+    # (full n_per_step x seq x vocab logits would OOM); grad_accum reassembles the full batch.
+    grad_accum = max(1, n_per_step // args.microbatch_size)
     target_model_id = os.environ.get("TARGET_MODEL", "Qwen/Qwen3-0.6B-Base")
     print(f"[dpg-grpo] devices={jax.devices()} target={target_model_id} M={args.grpo_steps} "
-          f"T={args.inner_steps} n_prompts={args.n_prompts} G={args.group_size} n/step={n_per_step}")
+          f"T={args.inner_steps} n/step={n_per_step} microbatch={args.microbatch_size} ga={grad_accum}")
 
     # ---- Target side (the real metagrad engine): Qwen3-0.6B-Base + sixseven, T inner Adam steps. ----
     config = get_config(
         target_model_id, dtype="fp32", sequence_length=args.seq_len,
-        microbatch_size=n_per_step, grad_accumulation_steps=grad_accum,
+        microbatch_size=args.microbatch_size, grad_accumulation_steps=grad_accum,
         total_batches=args.inner_steps, optimizer_type="adamw", learning_rate=args.lr_inner,
         weight_decay=1e-4, eps_root=1e-9, eps=1e-8, b1=0.9, b2=0.95, warmup_steps=None,
         use_manual_vjp=True, use_wandb=False,
@@ -187,11 +189,21 @@ def main():
         mask = (jnp.arange(token_seqs.shape[1] - 1)[None, :] >= (args.prompt_len - 1)).astype(jnp.float32)
         return jnp.sum(tok_logp * mask, axis=-1)                 # [batch]
 
+    # Process the policy-gradient loss in CHUNKS over the batch so the generator's
+    # [chunk x seq x vocab] logits tensor stays small (Qwen vocab=151936 would OOM at full batch).
+    gen_chunk = max(1, args.microbatch_size)
+
     @jax.jit
     def grpo_update(state, opt_state, token_seqs, advantages):
+        n = token_seqs.shape[0]
+        nchunks = (n + gen_chunk - 1) // gen_chunk
         def loss_fn(st):
-            lp = gen_logprob(st, token_seqs)
-            return -jnp.mean(advantages * lp)                    # REINFORCE w/ group-relative adv
+            total = 0.0
+            for c in range(nchunks):
+                sl = slice(c * gen_chunk, (c + 1) * gen_chunk)
+                lp = gen_logprob(st, token_seqs[sl])
+                total = total + jnp.sum(-advantages[sl] * lp)
+            return total / n
         loss, grads = jax.value_and_grad(loss_fn)(state)
         updates, opt_state = gen_opt.update(grads, opt_state, state)
         state = optax.apply_updates(state, updates)
@@ -210,9 +222,15 @@ def main():
         key, sk = jax.random.split(key)
         rep_prompts = jnp.repeat(base_prompts, args.group_size, axis=0)   # [n_per_step, prompt_len]
         gen_model = nnx.merge(gen_graphdef, gen_state)
+        # Generate in chunks to keep the decode-time logits tensor small (huge Qwen vocab).
         with mesh:
-            seqs = generate_tokens(gen_model, rep_prompts, max_new_tokens=args.resp_len,
-                                   max_seq_len=args.seq_len, temperature=1.0, key=sk)
+            chunks = []
+            for c in range((n_per_step + gen_chunk - 1) // gen_chunk):
+                key, gk = jax.random.split(key)
+                rp = rep_prompts[c * gen_chunk:(c + 1) * gen_chunk]
+                chunks.append(generate_tokens(gen_model, rp, max_new_tokens=args.resp_len,
+                                              max_seq_len=args.seq_len, temperature=1.0, key=gk))
+            seqs = jnp.concatenate(chunks, axis=0)
         # Pad/truncate to seq_len+1 so the loader can form input/label shift to length seq_len.
         if seqs.shape[1] < args.seq_len + 1:
             seqs = jnp.pad(seqs, ((0, 0), (0, args.seq_len + 1 - seqs.shape[1])))
