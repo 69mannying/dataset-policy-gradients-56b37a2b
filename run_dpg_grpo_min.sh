@@ -12,12 +12,16 @@ echo "=== single-GPU DPG GRPO repro ==="
 nvidia-smi -L || true
 cd "$REPO_DIR/dataset_metagradients_jax"
 
+# Target model to encode the pattern into (default Qwen3-0.6B-Base; the metric is robust to
+# tied embeddings). Smoke config: T=64 real inner Adam steps, M=20 GRPO steps -- cheap, and
+# enough to PROVE the fix (Phi must leave -ln2 and pixel_acc must respond) before scaling M up.
+export TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3-0.6B-Base}"
 uv run python -u scripts/run_dpg_grpo_min.py \
-    --grpo-steps "${GRPO_STEPS:-120}" \
-    --inner-steps "${INNER_STEPS:-8}" \
-    --n-prompts "${N_PROMPTS:-16}" \
+    --grpo-steps "${GRPO_STEPS:-20}" \
+    --inner-steps "${INNER_STEPS:-32}" \
+    --n-prompts "${N_PROMPTS:-8}" \
     --group-size "${GROUP_SIZE:-8}" \
-    --lr-inner "${LR_INNER:-1.0e-3}" \
+    --lr-inner "${LR_INNER:-2.0e-3}" \
     --lr-gen "${LR_GEN:-1.0e-4}" \
     --artifacts "$REPO_DIR/.openresearch/artifacts"
 

@@ -66,7 +66,7 @@ def save_image(arr, path, title=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grpo-steps", type=int, default=120, help="M: outer generator updates")
-    ap.add_argument("--inner-steps", type=int, default=8, help="T: target-model Adam steps in A")
+    ap.add_argument("--inner-steps", type=int, default=64, help="T: target-model Adam steps in A")
     ap.add_argument("--n-prompts", type=int, default=16, help="prompts per GRPO step")
     ap.add_argument("--group-size", type=int, default=8, help="G: rollouts per prompt (GRPO group)")
     ap.add_argument("--resp-len", type=int, default=32, help="generated tokens per rollout")
@@ -91,19 +91,23 @@ def main():
                    config=vars(args), mode="online")
 
     n_per_step = args.n_prompts * args.group_size           # generated examples per GRPO step
-    grad_accum = max(1, n_per_step // args.microbatch_size)
-    print(f"[dpg-grpo] devices={jax.devices()} M={args.grpo_steps} T={args.inner_steps} "
-          f"n_prompts={args.n_prompts} G={args.group_size} n/step={n_per_step} ga={grad_accum}")
+    # The inner loop does ONE Adam step per BATCH in the loader. To get T real inner steps we
+    # repeat the generated batch T times (paper trains the synthetic batch for T steps). So:
+    # grad_accum=1, microbatch = n_per_step (one full batch), and the dataset holds T copies.
+    grad_accum = 1
+    target_model_id = os.environ.get("TARGET_MODEL", "Qwen/Qwen3-0.6B-Base")
+    print(f"[dpg-grpo] devices={jax.devices()} target={target_model_id} M={args.grpo_steps} "
+          f"T={args.inner_steps} n_prompts={args.n_prompts} G={args.group_size} n/step={n_per_step}")
 
-    # ---- Target side (the real metagrad engine): GPT-2 + sixseven, T inner Adam steps. ----
+    # ---- Target side (the real metagrad engine): Qwen3-0.6B-Base + sixseven, T inner Adam steps. ----
     config = get_config(
-        "gpt2", dtype="fp32", sequence_length=args.seq_len,
-        microbatch_size=args.microbatch_size, grad_accumulation_steps=grad_accum,
+        target_model_id, dtype="fp32", sequence_length=args.seq_len,
+        microbatch_size=n_per_step, grad_accumulation_steps=grad_accum,
         total_batches=args.inner_steps, optimizer_type="adamw", learning_rate=args.lr_inner,
         weight_decay=1e-4, eps_root=1e-9, eps=1e-8, b1=0.9, b2=0.95, warmup_steps=None,
         use_manual_vjp=True, use_wandb=False,
         dataset_name="roneneldan/TinyStories", train_split="train", val_split="validation",
-        train_num_examples=n_per_step, val_num_examples=args.microbatch_size, shuffle=False,
+        train_num_examples=n_per_step, val_num_examples=n_per_step, shuffle=False,
     )
     components = setup_training(config)
     mesh = components.mesh
@@ -111,18 +115,46 @@ def main():
     tokenizer = components.tokenizer  # gpt2 tokenizer (shared by generator)
     vocab_size = len(tokenizer.vocab)
 
-    initial_lm_head = jnp.copy(trainer.model.lm_head.kernel.value)
+    def head_kernel(model):
+        """Return the (2D) LM-head weight variable. Robust to tied-embedding models
+        (Qwen3-Base ties lm_head to the input embedding) and to EasyDeL naming."""
+        m = model
+        for attrs in (("lm_head", "kernel"), ("lm_head", "weight")):
+            obj = m
+            ok = True
+            for a in attrs:
+                if hasattr(obj, a):
+                    obj = getattr(obj, a)
+                else:
+                    ok = False
+                    break
+            if ok and hasattr(obj, "value") and obj.value.ndim == 2:
+                return obj
+        # Tied / embedding fallback: find the largest 2D param (the vocab x dim matrix).
+        best = None
+        for path, leaf in nnx.iter_graph(m):
+            v = getattr(leaf, "value", None)
+            if v is not None and getattr(v, "ndim", 0) == 2 and v.shape[0] >= 1000:
+                if best is None or v.size > best.value.size:
+                    best = leaf
+        if best is None:
+            raise RuntimeError("could not locate a 2D LM-head/embedding matrix on the target model")
+        return best
+
+    _hk = head_kernel(trainer.model)
+    print(f"[dpg-grpo] target head matrix shape: {_hk.value.shape}")
+    initial_lm_head = jnp.copy(_hk.value)
     Pi = jax.lax.dynamic_slice(initial_lm_head, (0, 0), (6, 7))
     S = TARGET_67
     s = args.strength
 
     def target_metric_fn(model):
-        patch = jax.lax.dynamic_slice(model.lm_head.kernel.value, (0, 0), (6, 7))
+        patch = jax.lax.dynamic_slice(head_kernel(model).value, (0, 0), (6, 7))
         diff = patch - Pi
         return -jnp.mean(jnp.log(1 + jnp.exp(-s * S * diff)))
 
     def decode_acc(model):
-        diff = jax.lax.dynamic_slice(model.lm_head.kernel.value, (0, 0), (6, 7)) - Pi
+        diff = jax.lax.dynamic_slice(head_kernel(model).value, (0, 0), (6, 7)) - Pi
         decoded = jnp.sign(diff)
         return np.array(decoded), float(jnp.mean(decoded == S))
 
@@ -187,14 +219,17 @@ def main():
         seqs = seqs[:, :args.seq_len + 1]
 
         # 2) REWARD: per-example metagradient tau_i = dPhi/dw_i from the real inner loop.
-        #    Build a dataset of the generated sequences; do_tokenize=True does the next-token shift.
-        from datasets import Dataset
+        #    Train the SAME generated batch for T inner Adam steps. We hand-build T batches
+        #    (one global batch each, grad_accum=1) with STABLE indices 0..n_per_step-1 so the
+        #    metagradient w.r.t. data_weights[i] accumulates example i's influence across all
+        #    T steps (data_weights is indexed by `index`; repeating the index reuses the weight).
         seqs_np = np.array(seqs)
-        ds = Dataset.from_dict({"input_ids": [list(map(int, r)) for r in seqs_np]})
-        loader = create_batch_dataset(ds, args.microbatch_size, args.seq_len, grad_accum,
-                                      shuffle=False, drop_remainder=False, do_tokenize=True,
-                                      pad_token_id=tokenizer.pad_token_id,
-                                      eos_token_id=tokenizer.eos_token_id)
+        inp = seqs_np[:, :args.seq_len].astype(np.int32)        # [n_per_step, seq_len]
+        lbl = seqs_np[:, 1:args.seq_len + 1].astype(np.int32)
+        stable_index = np.arange(n_per_step, dtype=np.int32)
+        loader = [{"input_ids": jnp.asarray(inp), "labels": jnp.asarray(lbl),
+                   "index": jnp.asarray(stable_index)}
+                  for _ in range(args.inner_steps)]  # T batches => T inner Adam steps
         trainer.model = nnx.merge(target_graphdef, target_init_state)   # A resets each call
         trainer.checkpointer = create_checkpointer(strategy="disk", checkpoint_dir=config.checkpoint_dir)
         with mesh:
@@ -245,7 +280,7 @@ metagradient engine on **one GPU** (the paper's 8-GPU stack is just Llama rollou
 the mechanism is GPT-2-tiny). Algorithm 1, KL=0.
 
 ## Setup
-- Target A: **GPT-2** (EasyDeL), LM-head patch upper-left 6x7; T={args.inner_steps} Adam steps (LR {args.lr_inner}).
+- Target A: **{target_model_id}** (EasyDeL), LM-head patch upper-left 6x7; T={args.inner_steps} Adam steps (LR {args.lr_inner}).
 - Target Phi = `-mean(ln(1+exp(-s*Y(.)(Pc-Pi))))`, s={args.strength} (paper Eq.).
 - Reward = per-example metagradient `tau_i = dPhi/dw_i`.
 - Generator (policy): small nanoGPT ({args.gen_layers}L/{args.gen_dim}d), {args.n_prompts} prompts x G={args.group_size} rollouts/step.
@@ -261,7 +296,7 @@ the mechanism is GPT-2-tiny). Algorithm 1, KL=0.
 | GRPO steps | {args.grpo_steps} |
 | wall time | {time.time()-t0:.0f}s |
 
-**Verdict: {'SUCCESS — the "67" pattern is encoded in GPT-2 LM head (pixel acc >= 0.95).' if success else 'PARTIAL — best pixel acc %.3f (< 0.95); see history.json / pixel_accuracy curve.' % best_acc}**
+**Verdict: {('SUCCESS — the "67" pattern is encoded in %s LM head (pixel acc >= 0.95).' % target_model_id) if success else 'PARTIAL — best pixel acc %.3f (< 0.95); see history.json / pixel_accuracy curve.' % best_acc}**
 
 Evidence: `decoded_final.png`, `target_67.png`, `history.json`, W&B `target_metric/pixel_accuracy`.
 """
